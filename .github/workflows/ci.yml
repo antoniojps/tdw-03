@@ -68,11 +68,13 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
+      # checkout only for wrangler.jsonc; the site comes from the artifact
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
           name: site
           path: out
-      - run: npx wrangler pages deploy out --project-name=tdw
+      - run: npx wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -94,21 +96,28 @@ jobs:
       - run: npm run build
         env:
           NEXT_PUBLIC_SHA: ${{ github.event.pull_request.head.sha }}
-      - run: npx wrangler pages deploy out --project-name=tdw --branch=${{ github.head_ref }}
+      # Alias: lowercase, anything not a letter/digit becomes "-"
+      - id: alias
+        run: echo "name=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g')" >> "$GITHUB_OUTPUT"
+        env:
+          BRANCH: ${{ github.head_ref }}
+      # Uploads a version without touching production; prints the preview URLs
+      - id: upload
+        run: |
+          npx wrangler versions upload \
+            --preview-alias "${{ steps.alias.outputs.name }}" \
+            --message "PR #${{ github.event.number }} ${{ github.event.pull_request.head.sha }}" \
+            | tee upload.log
+          echo "url=$(grep -o 'Version Preview Alias URL: .*' upload.log | cut -d' ' -f5)" >> "$GITHUB_OUTPUT"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       - uses: actions/github-script@v8
         with:
           script: |
-            // Cloudflare Pages alias: lowercase, non-alphanumerics -> "-", max 28 chars
-            const alias = context.payload.pull_request.head.ref
-              .toLowerCase()
-              .replace(/[^a-z0-9]/g, "-")
-              .slice(0, 28);
             github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `Preview: https://${alias}.tdw.pages.dev`,
+              body: "Preview: ${{ steps.upload.outputs.url }}",
             });
