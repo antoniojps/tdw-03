@@ -45,7 +45,6 @@ jobs:
   build:
     name: Build
     needs: [lint, format, test]
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -55,7 +54,70 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+        env:
+          # on a pull request github.sha is a temporary merge commit; use the branch head instead
+          NEXT_PUBLIC_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/upload-artifact@v5
         with:
           name: site
           path: out
+
+  deploy:
+    name: Deploy
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      # checkout only for wrangler.jsonc; the site comes from the artifact
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: site
+          path: out
+      - run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+
+  preview:
+    name: Preview
+    needs: build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      # checkout only for wrangler.jsonc; the site comes from the artifact
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: site
+          path: out
+      # Alias: lowercase, anything not a letter/digit becomes "-"
+      - id: alias
+        run: echo "name=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g')" >> "$GITHUB_OUTPUT"
+        env:
+          BRANCH: ${{ github.head_ref }}
+      # Uploads a version without touching production; prints the preview URLs
+      - id: upload
+        shell: bash # GitHub's bash shell sets -o pipefail, so a wrangler failure fails the step
+        run: |
+          npx wrangler versions upload \
+            --preview-alias "${{ steps.alias.outputs.name }}" \
+            --message "PR #${{ github.event.number }} ${{ github.event.pull_request.head.sha }}" \
+            | tee upload.log
+          URL=$(grep -o 'Version Preview Alias URL: .*' upload.log | cut -d' ' -f5)
+          test -n "$URL" || { echo "::error::no preview URL in wrangler output"; exit 1; }
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: "Preview: ${{ steps.upload.outputs.url }}",
+            });
